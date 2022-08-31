@@ -16,6 +16,7 @@
 
 package com.palantir.baseline.errorprone.safety;
 
+import com.google.common.collect.ImmutableBiMap;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableListMultimap;
 import com.google.common.collect.ImmutableMap;
@@ -27,13 +28,18 @@ import com.google.errorprone.annotations.CheckReturnValue;
 import com.google.errorprone.dataflow.AccessPath;
 import com.google.errorprone.dataflow.AccessPathStore;
 import com.google.errorprone.dataflow.AccessPathValues;
+import com.google.errorprone.matchers.ChildMultiMatcher;
 import com.google.errorprone.matchers.Matcher;
 import com.google.errorprone.matchers.Matchers;
 import com.google.errorprone.matchers.method.MethodMatchers;
 import com.google.errorprone.util.ASTHelpers;
+import com.palantir.baseline.errorprone.MoreASTHelpers;
 import com.sun.source.tree.ClassTree;
 import com.sun.source.tree.ExpressionTree;
+import com.sun.source.tree.LambdaExpressionTree;
+import com.sun.source.tree.MethodTree;
 import com.sun.source.tree.Tree;
+import com.sun.source.tree.Tree.Kind;
 import com.sun.source.tree.TypeCastTree;
 import com.sun.source.tree.VariableTree;
 import com.sun.source.util.TreePath;
@@ -42,17 +48,25 @@ import com.sun.tools.javac.code.Flags;
 import com.sun.tools.javac.code.Symbol;
 import com.sun.tools.javac.code.Symbol.MethodSymbol;
 import com.sun.tools.javac.code.Symbol.VarSymbol;
-import com.sun.tools.javac.code.Type;
 import com.sun.tools.javac.processing.JavacProcessingEnvironment;
 import java.io.Closeable;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
+import java.util.OptionalDouble;
+import java.util.OptionalInt;
+import java.util.OptionalLong;
 import java.util.Set;
+import java.util.stream.BaseStream;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 import javax.annotation.Nullable;
 import javax.lang.model.element.VariableElement;
 import org.checkerframework.errorprone.dataflow.analysis.Analysis;
@@ -63,6 +77,7 @@ import org.checkerframework.errorprone.dataflow.analysis.TransferInput;
 import org.checkerframework.errorprone.dataflow.analysis.TransferResult;
 import org.checkerframework.errorprone.dataflow.cfg.ControlFlowGraph;
 import org.checkerframework.errorprone.dataflow.cfg.UnderlyingAST;
+import org.checkerframework.errorprone.dataflow.cfg.UnderlyingAST.CFGStatement;
 import org.checkerframework.errorprone.dataflow.cfg.builder.CFGBuilder;
 import org.checkerframework.errorprone.dataflow.cfg.node.ArrayAccessNode;
 import org.checkerframework.errorprone.dataflow.cfg.node.ArrayCreationNode;
@@ -137,6 +152,7 @@ import org.checkerframework.errorprone.dataflow.cfg.node.UnaryOperationNode;
 import org.checkerframework.errorprone.dataflow.cfg.node.UnsignedRightShiftNode;
 import org.checkerframework.errorprone.dataflow.cfg.node.VariableDeclarationNode;
 import org.checkerframework.errorprone.dataflow.cfg.node.WideningConversionNode;
+import org.checkerframework.errorprone.javacutil.TreePathUtil;
 
 /**
  * Heavily modified fork from error-prone NullnessPropagationTransfer (apache 2).
@@ -144,6 +160,7 @@ import org.checkerframework.errorprone.dataflow.cfg.node.WideningConversionNode;
  */
 public final class SafetyPropagationTransfer implements ForwardTransferFunction<Safety, AccessPathStore<Safety>> {
 
+    private static final Matcher<Tree> THROWABLE_SUBTYPE = Matchers.isSubtypeOf(Throwable.class);
     private static final Matcher<ExpressionTree> TO_STRING =
             MethodMatchers.instanceMethod().anyClass().named("toString").withNoParameters();
 
@@ -173,9 +190,151 @@ public final class SafetyPropagationTransfer implements ForwardTransferFunction<
                     .namedAnyOf("of", "copyOf"),
             MethodMatchers.staticMethod().onClass(Arrays.class.getName()).named("asList"));
 
+    private static final Matcher<ExpressionTree> OPTIONAL_FACTORIES = Matchers.anyOf(
+            MethodMatchers.staticMethod().onClass(Optional.class.getName()).namedAnyOf("of", "ofNullable"),
+            MethodMatchers.staticMethod()
+                    .onClassAny(
+                            OptionalInt.class.getName(), OptionalLong.class.getName(), OptionalDouble.class.getName())
+                    .named("of"));
+
+    private static final Matcher<ExpressionTree> STATIC_STREAM_FACTORIES =
+            MethodMatchers.staticMethod().onClass(Stream.class.getName()).namedAnyOf("of", "ofNullable", "concat");
+
+    private static final Matcher<ExpressionTree> RID_FACTORY = MethodMatchers.staticMethod()
+            .onClass("com.palantir.ri.ResourceIdentifier")
+            // capture all overloads -- in the case of the multi-parameter methods, only the 'locator' components
+            // really matter, however the rest are required to be safe, so they cannot poison results.
+            .namedAnyOf("of", "valueOf");
+
+    private static final Matcher<ExpressionTree> THROWABLES_STACK_TRACE_AS_STRING = MethodMatchers.staticMethod()
+            .onClass("com.google.common.base.Throwables")
+            .named("getStackTraceAsString")
+            .withParameters(Throwable.class.getName());
+
+    private static final Matcher<ExpressionTree> PRIMITIVE_BOXING = Matchers.anyOf(
+            MethodMatchers.staticMethod()
+                    .onClass(Boolean.class.getName())
+                    .named("valueOf")
+                    .withParameters("boolean"),
+            MethodMatchers.staticMethod()
+                    .onClass(Integer.class.getName())
+                    .named("valueOf")
+                    .withParameters("int"),
+            MethodMatchers.staticMethod()
+                    .onClass(Byte.class.getName())
+                    .named("valueOf")
+                    .withParameters("byte"),
+            MethodMatchers.staticMethod()
+                    .onClass(Character.class.getName())
+                    .named("valueOf")
+                    .withParameters("char"),
+            MethodMatchers.staticMethod()
+                    .onClass(Double.class.getName())
+                    .named("valueOf")
+                    .withParameters("double"),
+            MethodMatchers.staticMethod()
+                    .onClass(Float.class.getName())
+                    .named("valueOf")
+                    .withParameters("float"),
+            MethodMatchers.staticMethod()
+                    .onClass(Long.class.getName())
+                    .named("valueOf")
+                    .withParameters("long"),
+            MethodMatchers.staticMethod()
+                    .onClass(Short.class.getName())
+                    .named("valueOf")
+                    .withParameters("short"));
+
+    private static final Matcher<ExpressionTree> PRIMITIVE_UNBOXING = Matchers.anyOf(
+            MethodMatchers.instanceMethod()
+                    .onExactClass(Boolean.class.getName())
+                    .named("booleanValue")
+                    .withNoParameters(),
+            MethodMatchers.instanceMethod()
+                    .onExactClass(Integer.class.getName())
+                    .named("intValue")
+                    .withNoParameters(),
+            MethodMatchers.instanceMethod()
+                    .onExactClass(Byte.class.getName())
+                    .named("byteValue")
+                    .withNoParameters(),
+            MethodMatchers.instanceMethod()
+                    .onExactClass(Character.class.getName())
+                    .named("charValue")
+                    .withNoParameters(),
+            MethodMatchers.instanceMethod()
+                    .onExactClass(Double.class.getName())
+                    .named("doubleValue")
+                    .withNoParameters(),
+            MethodMatchers.instanceMethod()
+                    .onExactClass(Float.class.getName())
+                    .named("floatValue")
+                    .withNoParameters(),
+            MethodMatchers.instanceMethod()
+                    .onExactClass(Long.class.getName())
+                    .named("longValue")
+                    .withNoParameters(),
+            MethodMatchers.instanceMethod()
+                    .onExactClass(Short.class.getName())
+                    .named("shortValue")
+                    .withNoParameters());
+
     // These methods do not take the receiver (generally a static class) into account, only the inputs.
-    private static final Matcher<ExpressionTree> RETURNS_SAFETY_COMBINATION_OF_ARGS =
-            Matchers.anyOf(STRING_FORMAT, OBJECTS_TO_STRING, IMMUTABLE_COLLECTION_FACTORY);
+    private static final Matcher<ExpressionTree> RETURNS_SAFETY_COMBINATION_OF_ARGS = Matchers.anyOf(
+            STRING_FORMAT,
+            OBJECTS_TO_STRING,
+            IMMUTABLE_COLLECTION_FACTORY,
+            OPTIONAL_FACTORIES,
+            STATIC_STREAM_FACTORIES,
+            RID_FACTORY,
+            THROWABLES_STACK_TRACE_AS_STRING,
+            PRIMITIVE_BOXING);
+
+    private static final Matcher<ExpressionTree> CONSTRUCTOR_SAFETY_COMBINATION_OF_ARGS = Matchers.anyOf(
+            MethodMatchers.constructor().forClass(StringBuilder.class.getName()).withParameters(String.class.getName()),
+            MethodMatchers.constructor()
+                    .forClass(StringBuilder.class.getName())
+                    .withParameters(CharSequence.class.getName()),
+            MethodMatchers.constructor().forClass(StringBuffer.class.getName()).withParameters(String.class.getName()),
+            MethodMatchers.constructor()
+                    .forClass(StringBuffer.class.getName())
+                    .withParameters(CharSequence.class.getName()));
+
+    private static final Matcher<ExpressionTree> OPTIONAL_ACCESSORS = Matchers.anyOf(
+            MethodMatchers.instanceMethod()
+                    .onDescendantOf(Optional.class.getName())
+                    .namedAnyOf("filter", "get", "orElseThrow", "stream"),
+            MethodMatchers.instanceMethod()
+                    .onDescendantOf(OptionalInt.class.getName())
+                    .namedAnyOf("getAsInt", "orElseThrow"),
+            MethodMatchers.instanceMethod()
+                    .onDescendantOf(OptionalLong.class.getName())
+                    .namedAnyOf("getAsLong", "orElseThrow"),
+            MethodMatchers.instanceMethod()
+                    .onDescendantOf(OptionalDouble.class.getName())
+                    .namedAnyOf("getAsDouble", "orElseThrow"));
+
+    private static final Matcher<ExpressionTree> STREAM_ACCESSORS = Matchers.anyOf(
+            MethodMatchers.instanceMethod()
+                    .onDescendantOf(BaseStream.class.getName())
+                    .namedAnyOf("iterator", "spliterator", "sequential", "parallel", "unordered", "onClose"),
+            MethodMatchers.instanceMethod()
+                    .onDescendantOf(Stream.class.getName())
+                    .namedAnyOf(
+                            "filter",
+                            "distinct",
+                            "sorted",
+                            "peek",
+                            "limit",
+                            "skip",
+                            "takeWhile",
+                            "dropWhile",
+                            "toArray",
+                            "toList",
+                            "min",
+                            "max",
+                            "findFirst",
+                            "findAny"));
 
     // Returns the safety of the receiver, e.g. myString.getBytes() returns the safety of myString.
     private static final Matcher<ExpressionTree> RETURNS_SAFETY_OF_RECEIVER = Matchers.anyOf(
@@ -190,7 +349,20 @@ public final class SafetyPropagationTransfer implements ForwardTransferFunction<
                     .namedAnyOf("toArray", "stream", "parallelStream"),
             MethodMatchers.instanceMethod()
                     .onDescendantOf(Iterable.class.getName())
-                    .namedAnyOf("toArray", "iterator", "spliterator"));
+                    .namedAnyOf("toArray", "iterator", "spliterator"),
+            MethodMatchers.instanceMethod()
+                    .onDescendantOf(Iterator.class.getName())
+                    .named("next")
+                    .withNoParameters(),
+            // Rid components are considered safe, except for 'locator' which inherits the safety of the rid object.
+            MethodMatchers.instanceMethod()
+                    .onDescendantOf("com.palantir.ri.ResourceIdentifier")
+                    .named("getLocator")
+                    .withNoParameters(),
+            OPTIONAL_ACCESSORS,
+            STREAM_ACCESSORS,
+            THROWABLE_GET_MESSAGE,
+            PRIMITIVE_UNBOXING);
 
     private static final Matcher<ExpressionTree> RETURNS_SAFETY_OF_FIRST_ARG = Matchers.anyOf(
             MethodMatchers.staticMethod().onClass(Objects.class.getName()).named("requireNonNull"),
@@ -200,6 +372,44 @@ public final class SafetyPropagationTransfer implements ForwardTransferFunction<
             MethodMatchers.staticMethod()
                     .onClass("com.palantir.logsafe.Preconditions")
                     .namedAnyOf("checkNotNull", "checkArgumentNotNull"));
+
+    // Similar to RETURNS_SAFETY_OF_ARGS_AND_RECEIVER, except the variable itself is assigned the safety result.
+    // For example, the following returns do-not-log due to a mutation on the second line:
+    // StringBuilder sb = new StringBuilder().append(safe);
+    // sb.append(doNotLog);
+    // return sb.append(safe).toString();
+    private static final Matcher<ExpressionTree> MUTABLE_BUILDER_METHODS =
+            Matchers.anyOf(MethodMatchers.instanceMethod()
+                    .onExactClassAny(StringBuilder.class.getName(), StringBuffer.class.getName())
+                    .namedAnyOf("append", "insert", "replace"));
+
+    private static final Matcher<ExpressionTree> UNKNOWN_COLLECTORS = Matchers.anyOf(
+            MethodMatchers.staticMethod()
+                    .onClass(Collectors.class.getName())
+                    .named("counting")
+                    .withNoParameters(),
+            MethodMatchers.staticMethod()
+                    .onClass(Collectors.class.getName())
+                    .namedAnyOf("toMap", "toUnmodifiableMap", "toConcurrentMap"),
+            MethodMatchers.staticMethod().onClass(ImmutableMap.class.getName()).named("toImmutableMap"),
+            MethodMatchers.staticMethod()
+                    .onClass(ImmutableBiMap.class.getName())
+                    .named("toImmutableBiMap"));
+
+    private static final Matcher<ExpressionTree> COLLECT_INCLUDES_STREAM_SAFETY = Matchers.methodInvocation(
+            MethodMatchers.instanceMethod()
+                    .onDescendantOf(Stream.class.getName())
+                    .namedAnyOf("collect"),
+            ChildMultiMatcher.MatchType.LAST,
+            Matchers.not(UNKNOWN_COLLECTORS));
+
+    private static final Matcher<ExpressionTree> RETURNS_SAFETY_OF_ARGS_AND_RECEIVER = Matchers.anyOf(
+            COLLECT_INCLUDES_STREAM_SAFETY,
+            MethodMatchers.instanceMethod()
+                    .onDescendantOf(Optional.class.getName())
+                    // TODO(ckozak): support 'or' and 'orElseGet' which require lambda support
+                    .named("orElse"),
+            MUTABLE_BUILDER_METHODS);
 
     private VisitorState state;
     private final Set<VarSymbol> traversed = new HashSet<>();
@@ -212,7 +422,7 @@ public final class SafetyPropagationTransfer implements ForwardTransferFunction<
         AccessPathStore.Builder<Safety> result = AccessPathStore.<Safety>empty().toBuilder();
 
         for (LocalVariableNode param : parameters) {
-            Safety declared = SafetyAnnotations.getSafety((Symbol) param.getElement(), state);
+            Safety declared = SafetyAnnotations.getSafety(param.getTree(), state);
             result.setInformation(AccessPath.fromLocalVariable(param), declared);
         }
         return result.build();
@@ -330,14 +540,14 @@ public final class SafetyPropagationTransfer implements ForwardTransferFunction<
 
     private TransferResult<Safety, AccessPathStore<Safety>> unary(
             UnaryOperationNode node, TransferInput<Safety, AccessPathStore<Safety>> input) {
-        Safety safety = input.getValueOfSubNode(node.getOperand());
+        Safety safety = getValueOfSubNode(input, node.getOperand());
         return noStoreChanges(safety, input);
     }
 
     private TransferResult<Safety, AccessPathStore<Safety>> binary(
             BinaryOperationNode node, TransferInput<Safety, AccessPathStore<Safety>> input) {
-        Safety safety = input.getValueOfSubNode(node.getLeftOperand())
-                .leastUpperBound(input.getValueOfSubNode(node.getRightOperand()));
+        Safety safety = getValueOfSubNode(input, node.getLeftOperand())
+                .leastUpperBound(getValueOfSubNode(input, node.getRightOperand()));
         return noStoreChanges(safety, input);
     }
 
@@ -509,8 +719,8 @@ public final class SafetyPropagationTransfer implements ForwardTransferFunction<
     @Override
     public TransferResult<Safety, AccessPathStore<Safety>> visitStringConcatenateAssignment(
             StringConcatenateAssignmentNode node, TransferInput<Safety, AccessPathStore<Safety>> input) {
-        Safety safety = input.getValueOfSubNode(node.getLeftOperand())
-                .leastUpperBound(input.getValueOfSubNode(node.getRightOperand()));
+        Safety safety = getValueOfSubNode(input, node.getLeftOperand())
+                .leastUpperBound(getValueOfSubNode(input, node.getRightOperand()));
         ReadableUpdates updates = new ReadableUpdates();
         updates.trySet(node.getLeftOperand(), safety);
         return updateRegularStore(safety, input, updates);
@@ -519,49 +729,57 @@ public final class SafetyPropagationTransfer implements ForwardTransferFunction<
     @Override
     public TransferResult<Safety, AccessPathStore<Safety>> visitLessThan(
             LessThanNode node, TransferInput<Safety, AccessPathStore<Safety>> input) {
-        return binary(node, input);
+        // 'a < b' in source is safe, regardless of 'a' and 'b'.
+        return noStoreChanges(Safety.SAFE, input);
     }
 
     @Override
     public TransferResult<Safety, AccessPathStore<Safety>> visitLessThanOrEqual(
             LessThanOrEqualNode node, TransferInput<Safety, AccessPathStore<Safety>> input) {
-        return binary(node, input);
+        // 'a <= b' in source is safe, regardless of 'a' and 'b'.
+        return noStoreChanges(Safety.SAFE, input);
     }
 
     @Override
     public TransferResult<Safety, AccessPathStore<Safety>> visitGreaterThan(
-            GreaterThanNode node, TransferInput<Safety, AccessPathStore<Safety>> input) {
-        return binary(node, input);
+            GreaterThanNode _node, TransferInput<Safety, AccessPathStore<Safety>> input) {
+        // 'a > b' in source is safe, regardless of 'a' and 'b'.
+        return noStoreChanges(Safety.SAFE, input);
     }
 
     @Override
     public TransferResult<Safety, AccessPathStore<Safety>> visitGreaterThanOrEqual(
-            GreaterThanOrEqualNode node, TransferInput<Safety, AccessPathStore<Safety>> input) {
-        return binary(node, input);
+            GreaterThanOrEqualNode _node, TransferInput<Safety, AccessPathStore<Safety>> input) {
+        // 'a >= b' in source is safe, regardless of 'a' and 'b'.
+        return noStoreChanges(Safety.SAFE, input);
     }
 
     @Override
     public TransferResult<Safety, AccessPathStore<Safety>> visitEqualTo(
-            EqualToNode node, TransferInput<Safety, AccessPathStore<Safety>> input) {
-        return binary(node, input);
+            EqualToNode _node, TransferInput<Safety, AccessPathStore<Safety>> input) {
+        // 'a == b' in source is safe, regardless of 'a' and 'b'.
+        return noStoreChanges(Safety.SAFE, input);
     }
 
     @Override
     public TransferResult<Safety, AccessPathStore<Safety>> visitNotEqual(
-            NotEqualNode node, TransferInput<Safety, AccessPathStore<Safety>> input) {
-        return binary(node, input);
+            NotEqualNode _node, TransferInput<Safety, AccessPathStore<Safety>> input) {
+        // 'a != b' in source is safe, regardless of 'a' and 'b'.
+        return noStoreChanges(Safety.SAFE, input);
     }
 
     @Override
     public TransferResult<Safety, AccessPathStore<Safety>> visitConditionalAnd(
             ConditionalAndNode node, TransferInput<Safety, AccessPathStore<Safety>> input) {
-        return binary(node, input);
+        // 'a && b' in source is safe, regardless of 'a' and 'b'.
+        return noStoreChanges(Safety.SAFE, input);
     }
 
     @Override
     public TransferResult<Safety, AccessPathStore<Safety>> visitConditionalOr(
             ConditionalOrNode node, TransferInput<Safety, AccessPathStore<Safety>> input) {
-        return binary(node, input);
+        // 'a || b' in source is safe, regardless of 'a' and 'b'.
+        return noStoreChanges(Safety.SAFE, input);
     }
 
     @Override
@@ -573,8 +791,8 @@ public final class SafetyPropagationTransfer implements ForwardTransferFunction<
     @Override
     public TransferResult<Safety, AccessPathStore<Safety>> visitTernaryExpression(
             TernaryExpressionNode node, TransferInput<Safety, AccessPathStore<Safety>> input) {
-        Safety safety = input.getValueOfSubNode(node.getThenOperand())
-                .leastUpperBound(input.getValueOfSubNode(node.getElseOperand()));
+        Safety safety = getValueOfSubNode(input, node.getThenOperand())
+                .leastUpperBound(getValueOfSubNode(input, node.getElseOperand()));
         return noStoreChanges(safety, input);
     }
 
@@ -588,16 +806,15 @@ public final class SafetyPropagationTransfer implements ForwardTransferFunction<
     public TransferResult<Safety, AccessPathStore<Safety>> visitAssignment(
             AssignmentNode node, TransferInput<Safety, AccessPathStore<Safety>> input) {
         ReadableUpdates updates = new ReadableUpdates();
-        Safety expressionSafety = input.getValueOfSubNode(node.getExpression());
-        Safety targetSymbolSafety = SafetyAnnotations.getSafety(
-                ASTHelpers.getSymbol(node.getTarget().getTree()), state);
-        Safety safety = Safety.mergeAssumingUnknownIsSame(expressionSafety, targetSymbolSafety);
+        Safety expressionSafety = getValueOfSubNode(input, node.getExpression());
+        Safety targetSafety = SafetyAnnotations.getSafety(node.getTarget().getTree(), state);
+        Safety safety = Safety.mergeAssumingUnknownIsSame(expressionSafety, targetSafety);
         Node target = node.getTarget();
         if (target instanceof LocalVariableNode) {
             updates.trySet(target, safety);
         } else if (target instanceof ArrayAccessNode) {
             Node arrayNode = ((ArrayAccessNode) target).getArray();
-            Safety arrayNodeSafety = input.getValueOfSubNode(arrayNode);
+            Safety arrayNodeSafety = getValueOfSubNode(input, arrayNode);
             safety = arrayNodeSafety == null ? safety : arrayNodeSafety.leastUpperBound(safety);
             updates.trySet(arrayNode, safety);
         } else if (target instanceof FieldAccessNode) {
@@ -613,10 +830,95 @@ public final class SafetyPropagationTransfer implements ForwardTransferFunction<
     @Override
     public TransferResult<Safety, AccessPathStore<Safety>> visitLocalVariable(
             LocalVariableNode node, TransferInput<Safety, AccessPathStore<Safety>> input) {
-        Safety safety = hasNonNullConstantValue(node)
-                ? Safety.SAFE
-                : input.getRegularStore().valueOfAccessPath(AccessPath.fromLocalVariable(node), Safety.UNKNOWN);
+        if (hasNonNullConstantValue(node)) {
+            return noStoreChanges(Safety.SAFE, input);
+        }
+        AccessPath accessPath = AccessPath.fromLocalVariable(node);
+        Safety safety = input.getRegularStore().valueOfAccessPath(accessPath, null);
+        if (safety == null) {
+            // This may occur in one of several ways:
+            // 1. catch (SomeThrowable t)
+            // 2. referencing a captured local variable within a lambda
+            // 3. referencing a captured local variable within an anonymous class
+            // 4. Pattern matching (input instanceof String str)
+
+            // Cast a wide net for all throwables (covers catch statements)
+            if (THROWABLE_SUBTYPE.matches(node.getTree(), state)) {
+                safety = Safety.UNSAFE.leastUpperBound(SafetyAnnotations.getSafety(node.getTree(), state));
+            } else if (isPatternBinding(node, state)) {
+                safety = SafetyAnnotations.getSafety(node.getTree(), state);
+            } else {
+                // No safety information found, likely a captured reference used within a lambda or anonymous class.
+                safety = getCapturedLocalVariableSafety(node);
+            }
+        }
         return noStoreChanges(safety, input);
+    }
+
+    private static boolean isPatternBinding(LocalVariableNode node, VisitorState state) {
+        TreePath varPath = TreePath.getPath(state.getPath().getCompilationUnit(), node.getTree());
+        if (varPath == null) {
+            // Synthetic expression
+            return false;
+        }
+        TreePath parentPath = varPath.getParentPath();
+        if (parentPath == null) {
+            return false;
+        }
+        Tree enclosing = parentPath.getLeaf();
+        if (enclosing == null) {
+            return false;
+        }
+        // JCBindingPattern is newer than our compilation target, so we match strings to avoid
+        // complex build-system configurations.
+        String kindString = enclosing.getKind().name();
+        return "BINDING_PATTERN".equals(kindString);
+    }
+
+    private Safety getCapturedLocalVariableSafety(LocalVariableNode node) {
+        Symbol symbol = ASTHelpers.getSymbol(node.getTree());
+        if (!(symbol instanceof VarSymbol)) {
+            return Safety.UNKNOWN;
+        }
+        VarSymbol variableSymbol = (VarSymbol) symbol;
+        JavacProcessingEnvironment javacEnv = JavacProcessingEnvironment.instance(state.context);
+        TreePath variableDefinition = Trees.instance(javacEnv).getPath(variableSymbol);
+        if (variableDefinition == null) {
+            return Safety.UNKNOWN;
+        }
+        TreePath enclosingPath =
+                TreePathUtil.pathTillOfKind(variableDefinition, EnumSet.of(Kind.METHOD, Kind.LAMBDA_EXPRESSION));
+        if (enclosingPath == null) {
+            return Safety.UNKNOWN;
+        }
+        if (!traversed.add(variableSymbol)) {
+            // Avoid infinite recursion between sub-analysis cycles
+            return Safety.UNKNOWN;
+        }
+        try {
+            UnderlyingAST ast = createAst(enclosingPath);
+            ControlFlowGraph cfg = CFGBuilder.build(state.getPath().getCompilationUnit(), ast, false, false, javacEnv);
+            Analysis<Safety, AccessPathStore<Safety>, SafetyPropagationTransfer> analysis =
+                    new ForwardAnalysisImpl<>(this);
+            analysis.performAnalysis(cfg);
+            Safety maybeResult = analysis.getValue(variableDefinition.getLeaf());
+            return maybeResult == null ? Safety.UNKNOWN : maybeResult;
+        } finally {
+            traversed.remove(variableSymbol);
+        }
+    }
+
+    private static UnderlyingAST createAst(TreePath path) {
+        Tree tree = path.getLeaf();
+        ClassTree enclosingClass = TreePathUtil.enclosingClass(path);
+        if (tree instanceof MethodTree) {
+            return new UnderlyingAST.CFGMethod((MethodTree) tree, enclosingClass);
+        }
+        if (tree instanceof LambdaExpressionTree) {
+            return new UnderlyingAST.CFGLambda(
+                    (LambdaExpressionTree) tree, enclosingClass, TreePathUtil.enclosingMethod(path));
+        }
+        return new CFGStatement(tree, enclosingClass);
     }
 
     private static boolean hasNonNullConstantValue(LocalVariableNode node) {
@@ -630,9 +932,8 @@ public final class SafetyPropagationTransfer implements ForwardTransferFunction<
     @Override
     public TransferResult<Safety, AccessPathStore<Safety>> visitVariableDeclaration(
             VariableDeclarationNode node, TransferInput<Safety, AccessPathStore<Safety>> input) {
-        Safety variableTypeSafety =
-                SafetyAnnotations.getSafety(ASTHelpers.getSymbol(node.getTree().getType()), state);
-        Safety variableSafety = SafetyAnnotations.getSafety(ASTHelpers.getSymbol(node.getTree()), state);
+        Safety variableTypeSafety = SafetyAnnotations.getSafety(node.getTree().getType(), state);
+        Safety variableSafety = SafetyAnnotations.getSafety(node.getTree(), state);
         Safety safety = Safety.mergeAssumingUnknownIsSame(variableTypeSafety, variableSafety);
         return noStoreChanges(safety, input);
     }
@@ -640,13 +941,11 @@ public final class SafetyPropagationTransfer implements ForwardTransferFunction<
     @Override
     public TransferResult<Safety, AccessPathStore<Safety>> visitFieldAccess(
             FieldAccessNode node, TransferInput<Safety, AccessPathStore<Safety>> input) {
-        Safety fieldSafety = SafetyAnnotations.getSafety(ASTHelpers.getSymbol(node.getTree()), state);
-        Type fieldType = ASTHelpers.getType(node.getTree());
-        Safety typeSafety = fieldType == null ? Safety.UNKNOWN : SafetyAnnotations.getSafety(fieldType.tsym, state);
+        Safety fieldSafety = SafetyAnnotations.getSafety(node.getTree(), state);
         VarSymbol symbol = (VarSymbol) ASTHelpers.getSymbol(node.getTree());
         AccessPath maybeAccessPath = AccessPath.fromFieldAccess(node);
         Safety flowSafety = fieldSafety(symbol, maybeAccessPath, input.getRegularStore());
-        Safety safety = Safety.mergeAssumingUnknownIsSame(fieldSafety, typeSafety, flowSafety);
+        Safety safety = Safety.mergeAssumingUnknownIsSame(fieldSafety, flowSafety);
         return noStoreChanges(safety, input);
     }
 
@@ -769,7 +1068,7 @@ public final class SafetyPropagationTransfer implements ForwardTransferFunction<
     public TransferResult<Safety, AccessPathStore<Safety>> visitReturn(
             ReturnNode node, TransferInput<Safety, AccessPathStore<Safety>> input) {
         Node result = node.getResult();
-        Safety safety = result == null ? Safety.SAFE : input.getValueOfSubNode(result);
+        Safety safety = result == null ? Safety.SAFE : getValueOfSubNode(input, result);
         return noStoreChanges(safety, input);
     }
 
@@ -782,7 +1081,7 @@ public final class SafetyPropagationTransfer implements ForwardTransferFunction<
     @Override
     public TransferResult<Safety, AccessPathStore<Safety>> visitStringConversion(
             StringConversionNode node, TransferInput<Safety, AccessPathStore<Safety>> input) {
-        Safety safety = input.getValueOfSubNode(node.getOperand());
+        Safety safety = getValueOfSubNode(input, node.getOperand());
         return noStoreChanges(safety, input);
     }
 
@@ -808,18 +1107,40 @@ public final class SafetyPropagationTransfer implements ForwardTransferFunction<
     /** Handles type changes (widen, narrow, and cast). */
     private TransferResult<Safety, AccessPathStore<Safety>> handleTypeConversion(
             Tree newType, Node original, TransferInput<Safety, AccessPathStore<Safety>> input) {
-        Safety valueSafety = input.getValueOfSubNode(original);
-        Type targetType = ASTHelpers.getType(newType);
-        Safety narrowTargetSafety =
-                targetType == null ? Safety.UNKNOWN : SafetyAnnotations.getSafety(targetType.tsym, state);
-        Safety resultSafety = Safety.mergeAssumingUnknownIsSame(valueSafety, narrowTargetSafety);
-        return noStoreChanges(resultSafety, input);
+        return noStoreChanges(getTypeConversionSafety(newType, original, input), input);
+    }
+
+    private Safety getTypeConversionSafety(
+            Tree newType, Node original, TransferInput<Safety, AccessPathStore<Safety>> input) {
+        Safety inputSafety = getValueOfSubNode(input, original);
+        Safety targetSafety = SafetyAnnotations.getSafety(newType, state);
+        Safety resultSafety;
+        if (!targetSafety.allowsValueWith(inputSafety)
+                && ASTHelpers.isSubtype(
+                        MoreASTHelpers.getResultType(newType),
+                        MoreASTHelpers.getResultType(original.getTree()),
+                        state)) {
+            // In the case that the cast target is more specific than the input, propagate the safety of the cast
+            // target. Validation occurs when the type itself is constructed, the cast exposes previous validation.
+            resultSafety = targetSafety;
+        } else {
+            resultSafety = Safety.mergeAssumingUnknownIsSame(inputSafety, targetSafety);
+        }
+        return resultSafety;
     }
 
     @Override
     public TransferResult<Safety, AccessPathStore<Safety>> visitInstanceOf(
             InstanceOfNode node, TransferInput<Safety, AccessPathStore<Safety>> input) {
-        return unknown(input);
+        LocalVariableNode bindingVariable = node.getBindingVariable();
+        if (bindingVariable != null) {
+            Safety safety = getTypeConversionSafety(node.getTree().getType(), node.getOperand(), input);
+            ReadableUpdates updates = new ReadableUpdates();
+            updates.set(bindingVariable, safety);
+            return updateRegularStore(Safety.SAFE, input, updates);
+        }
+        // Otherwise types themselves are generally safe, boolean results of type checks are always safe.
+        return noStoreChanges(Safety.SAFE, input);
     }
 
     @Override
@@ -852,49 +1173,71 @@ public final class SafetyPropagationTransfer implements ForwardTransferFunction<
         Safety methodSymbolSafety = getMethodSymbolSafety(node, input);
         Safety knownMethodSafety = getKnownMethodSafety(node, input);
         Safety result = Safety.mergeAssumingUnknownIsSame(methodSymbolSafety, knownMethodSafety);
-        return noStoreChanges(result, input);
+        if (MUTABLE_BUILDER_METHODS.matches(node.getTree(), state)) {
+            ReadableUpdates updates = new ReadableUpdates();
+            Node current = node.getTarget().getReceiver();
+            while (current instanceof MethodInvocationNode) {
+                MethodInvocationNode currentInvocation = (MethodInvocationNode) current;
+                if (MUTABLE_BUILDER_METHODS.matches(currentInvocation.getTree(), state)) {
+                    current = currentInvocation.getTarget().getReceiver();
+                } else {
+                    break;
+                }
+            }
+            updates.trySet(current, result);
+            return updateRegularStore(result, input, updates);
+        } else {
+            return noStoreChanges(result, input);
+        }
     }
 
     private Safety getKnownMethodSafety(
             MethodInvocationNode node, TransferInput<Safety, AccessPathStore<Safety>> input) {
-        if (THROWABLE_GET_MESSAGE.matches(node.getTree(), state)) {
-            // Auth failures are sometimes annotated '@DoNotLog', which getMessage should inherit.
-            return Safety.mergeAssumingUnknownIsSame(
-                    Safety.UNSAFE, input.getValueOfSubNode(node.getTarget().getReceiver()));
+        if (RETURNS_SAFETY_OF_ARGS_AND_RECEIVER.matches(node.getTree(), state)) {
+            Safety safety = getValueOfSubNode(input, node.getTarget().getReceiver());
+            for (Node argument : node.getArguments()) {
+                safety = safety.leastUpperBound(getValueOfSubNode(input, argument));
+            }
+            return safety;
         } else if (RETURNS_SAFETY_COMBINATION_OF_ARGS.matches(node.getTree(), state)) {
             Safety safety = Safety.SAFE;
             for (Node argument : node.getArguments()) {
-                safety = safety.leastUpperBound(input.getValueOfSubNode(argument));
+                safety = safety.leastUpperBound(getValueOfSubNode(input, argument));
             }
             return safety;
         } else if (RETURNS_SAFETY_OF_RECEIVER.matches(node.getTree(), state)) {
-            return input.getValueOfSubNode(node.getTarget().getReceiver());
+            return getValueOfSubNode(input, node.getTarget().getReceiver());
         } else if (RETURNS_SAFETY_OF_FIRST_ARG.matches(node.getTree(), state)) {
-            return input.getValueOfSubNode(node.getArguments().get(0));
+            return getValueOfSubNode(input, node.getArguments().get(0));
         }
         return Safety.UNKNOWN;
     }
 
     private Safety getMethodSymbolSafety(
             MethodInvocationNode node, TransferInput<Safety, AccessPathStore<Safety>> input) {
-        Safety resultTypeSafety = SafetyAnnotations.getResultTypeSafety(node.getTree(), state);
+        Safety methodSafety = SafetyAnnotations.getSafety(node.getTree(), state);
         MethodSymbol methodSymbol = ASTHelpers.getSymbol(node.getTree());
         if (methodSymbol != null) {
-            Safety methodSafety = Safety.mergeAssumingUnknownIsSame(
-                    SafetyAnnotations.getSafety(methodSymbol, state), resultTypeSafety);
             // non-annotated toString inherits type-level safety.
             if (methodSafety == Safety.UNKNOWN && TO_STRING.matches(node.getTree(), state)) {
-                return input.getValueOfSubNode(node.getTarget().getReceiver());
+                return getValueOfSubNode(input, node.getTarget().getReceiver());
             }
             return methodSafety;
         }
-        return resultTypeSafety;
+        return methodSafety;
     }
 
     @Override
     public TransferResult<Safety, AccessPathStore<Safety>> visitObjectCreation(
             ObjectCreationNode node, TransferInput<Safety, AccessPathStore<Safety>> input) {
         Safety result = SafetyAnnotations.getSafety(node.getTree(), state);
+        if (CONSTRUCTOR_SAFETY_COMBINATION_OF_ARGS.matches(node.getTree(), state)) {
+            Safety safety = Safety.SAFE;
+            for (Node argument : node.getArguments()) {
+                safety = safety.leastUpperBound(getValueOfSubNode(input, argument));
+            }
+            result = Safety.mergeAssumingUnknownIsSame(result, safety);
+        }
         return noStoreChanges(result, input);
     }
 
@@ -909,7 +1252,7 @@ public final class SafetyPropagationTransfer implements ForwardTransferFunction<
             ArrayCreationNode node, TransferInput<Safety, AccessPathStore<Safety>> input) {
         Safety safety = Safety.SAFE;
         for (Node item : node.getInitializers()) {
-            safety = safety.leastUpperBound(input.getValueOfSubNode(item));
+            safety = safety.leastUpperBound(getValueOfSubNode(input, item));
         }
         return noStoreChanges(safety, input);
     }
@@ -954,5 +1297,14 @@ public final class SafetyPropagationTransfer implements ForwardTransferFunction<
     public TransferResult<Safety, AccessPathStore<Safety>> visitClassDeclaration(
             ClassDeclarationNode node, TransferInput<Safety, AccessPathStore<Safety>> input) {
         return unknown(input);
+    }
+
+    /**
+     * Equivalent to {@link TransferInput#getValueOfSubNode(Node)},
+     * but returning {@link Safety#UNKNOWN} rather than null.
+     */
+    private static Safety getValueOfSubNode(TransferInput<Safety, AccessPathStore<Safety>> input, Node node) {
+        Safety maybeSafety = input.getValueOfSubNode(node);
+        return Safety.nullToUnknown(maybeSafety);
     }
 }
