@@ -99,6 +99,9 @@
         <module name="EmptyStatement"/> <!-- Java Style Guide: One statement per line -->
         <module name="EqualsHashCode"/>
         <module name="FallThrough"/> <!-- Java Style Guide: Fall-through: commented -->
+        <module name="FinalLocalVariable">
+            <property name="tokens" value="VARIABLE_DEF,PARAMETER_DEF"/>
+        </module>
         <module name="GenericWhitespace"> <!-- Java Style Guide: Horizontal whitespace -->
             <message key="ws.followed" value="GenericWhitespace ''{0}'' is followed by whitespace."/>
             <message key="ws.preceded" value="GenericWhitespace ''{0}'' is preceded with whitespace."/>
