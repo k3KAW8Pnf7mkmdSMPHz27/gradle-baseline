@@ -100,7 +100,10 @@
         <module name="EqualsHashCode"/>
         <module name="FallThrough"/> <!-- Java Style Guide: Fall-through: commented -->
         <module name="FinalLocalVariable">
-            <property name="tokens" value="VARIABLE_DEF,PARAMETER_DEF"/>
+            <property name="tokens" value="VARIABLE_DEF"/>
+        </module>
+        <module name="FinalParameters">
+            <property name="tokens" value="CTOR_DEF, METHOD_DEF"/>
         </module>
         <module name="GenericWhitespace"> <!-- Java Style Guide: Horizontal whitespace -->
             <message key="ws.followed" value="GenericWhitespace ''{0}'' is followed by whitespace."/>
